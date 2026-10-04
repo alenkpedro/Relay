@@ -4,11 +4,11 @@
 
 <p align="center">Uma caixa de entrada local para WhatsApp, Telegram, Signal, Discord, Instagram e mais.</p>
 
-<p align="center"><a href="https://github.com/alenkpedro/relay-releases/releases/latest"><b>Baixar a versão mais recente</b></a> · macOS com chip Apple</p>
+<p align="center"><a href="https://github.com/alenkpedro/relay/releases/latest"><b>Baixar a versão mais recente</b></a> · macOS com chip Apple</p>
 
 ## Instalação
 
-1. Baixe o `Relay-<versão>-arm64.dmg` da [última versão](https://github.com/alenkpedro/relay-releases/releases/latest).
+1. Baixe o `Relay-<versão>-arm64.dmg` da [última versão](https://github.com/alenkpedro/relay/releases/latest).
 2. Abra o `.dmg` e arraste o Relay para **Aplicativos**.
 3. Se o macOS não deixar abrir na primeira vez: **Ajustes do Sistema → Privacidade e Segurança → Abrir Mesmo Assim**.
 
