@@ -1,0 +1,972 @@
+diff --git a/pkg/connector/commands.go b/pkg/connector/commands.go
+index 037d24e..4d1db8d 100644
+--- a/pkg/connector/commands.go
++++ b/pkg/connector/commands.go
+@@ -31,6 +31,7 @@ import (
+ 	"go.mau.fi/whatsmeow/types"
+ 	"maunium.net/go/mautrix/bridgev2"
+ 	"maunium.net/go/mautrix/bridgev2/commands"
++	"maunium.net/go/mautrix/bridgev2/networkid"
+ 	"maunium.net/go/mautrix/bridgev2/simplevent"
+ 
+ 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
+@@ -89,6 +90,21 @@ var cmdSync = &commands.FullHandler{
+ 
+ func fnSync(ce *commands.Event) {
+ 	login := ce.User.GetDefaultLogin()
++	// Relay patch: `--login=<login ID>` picks which account to sync with (default: the first one).
++	// Profile photos restricted to "my contacts" can only be fetched by the account that has the
++	// contact's privacy token, so resyncing through the right account matters.
++	for i, arg := range ce.Args {
++		if loginID, ok := strings.CutPrefix(arg, "--login="); ok {
++			if explicit := ce.Bridge.GetCachedUserLoginByID(networkid.UserLoginID(loginID)); explicit != nil && explicit.UserMXID == ce.User.MXID {
++				login = explicit
++			} else {
++				ce.Reply("Login `%s` not found", loginID)
++				return
++			}
++			ce.Args = append(ce.Args[:i:i], ce.Args[i+1:]...)
++			break
++		}
++	}
+ 	if login == nil {
+ 		ce.Reply("Login not found")
+ 		return
+@@ -116,6 +132,18 @@ func fnSync(ce *commands.Event) {
+ 			GetChatInfoFunc: wa.GetChatInfo,
+ 		})
+ 		ce.React("✅")
++	case "favorite-stickers":
++		// Relay patch: see relay_stickers.go
++		go func() {
++			ctx := wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
++			if err := wa.relaySyncFavoriteStickers(ctx); err != nil {
++				wa.UserLogin.Log.Warn().Err(err).Msg("Favorite sticker sync finished with errors")
++			}
++		}()
++		ce.React("✅")
++	case "relay":
++		// Relay patch: group admin, invite links, contact info and blocking (see relay_power.go)
++		wa.relayPowerCommand(ce)
+ 	case "groups":
+ 		groups, err := wa.Client.GetJoinedGroups(ce.Ctx)
+ 		if err != nil {
+diff --git a/pkg/connector/connector.go b/pkg/connector/connector.go
+index d7261d3..8210a37 100644
+--- a/pkg/connector/connector.go
++++ b/pkg/connector/connector.go
+@@ -164,6 +164,7 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
+ 	if err != nil {
+ 		return fmt.Errorf("failed to migrate to LID DMs: %w", err)
+ 	}
++	wa.relayRegisterRoutes() // Relay patch: see relay_presence.go
+ 	go func() {
+ 		err = wa.syncMismatchingGhosts(wa.Bridge.BackgroundCtx)
+ 		if err != nil {
+diff --git a/pkg/connector/handlewhatsapp.go b/pkg/connector/handlewhatsapp.go
+index 5381311..2160905 100644
+--- a/pkg/connector/handlewhatsapp.go
++++ b/pkg/connector/handlewhatsapp.go
+@@ -79,6 +79,9 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
+ 	log := wa.UserLogin.Log
+ 	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
+ 	wa.MC.OnWhatsAppEvent(rawEvt)
++	if wa.relayIgnoreDuringStickerSync(rawEvt) || wa.relayHandlePeerResponse(rawEvt) {
++		return true
++	}
+ 
+ 	success = true
+ 	switch evt := rawEvt.(type) {
+@@ -147,7 +150,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
+ 	case *events.AppStateSyncError:
+ 		wa.handleWAAppStateSyncError(ctx, evt)
+ 	case *events.AppState:
+-		// Intentionally ignored
++		wa.relayHandleAppState(ctx, evt) // Relay patch: favorite stickers
+ 	case *events.PushNameSetting:
+ 		// Send presence available when connecting and when the pushname is changed.
+ 		// This makes sure that outgoing messages always have the right pushname.
+@@ -542,6 +545,10 @@ func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.
+ 	if evt.State == types.ChatPresencePaused {
+ 		timeout = 0
+ 	}
++	// Relay patch: Matrix typing has no "recording" kind and the Matrix side drops it, so send it as
++	// typing and remember it for Relay's /v3/relay/recording (see relay_presence.go).
++	wa.relayNoteRecording(evt.Chat, evt.Sender, typingType == bridgev2.TypingTypeRecordingMedia && timeout > 0, timeout)
++	typingType = bridgev2.TypingTypeText
+ 
+ 	wa.UserLogin.QueueRemoteEvent(&simplevent.Typing{
+ 		EventMeta: simplevent.EventMeta{
+diff --git a/pkg/connector/relay_power.go b/pkg/connector/relay_power.go
+new file mode 100644
+index 0000000..555e6f7
+--- /dev/null
++++ b/pkg/connector/relay_power.go
+@@ -0,0 +1,364 @@
++// Relay patch: WhatsApp "power features" Relay can't reach through plain Matrix events.
++//
++// `!wa sync relay <nonce> <op> [args…]` runs one operation and answers in the command room with
++// a single m.notice "relay:<nonce> <JSON>", which Relay (electron/local.cjs whatsappPower) waits
++// for. The JSON is {"ok":true,…} or {"ok":false,"error":"…"}. Operations:
++//
++//	group-info   <!room>                                 participants (with admin flags) and settings
++//	leave        <!room>                                 leave the WhatsApp group
++//	invite-link  <!room> [reset]                         get (or revoke and regenerate) the invite link
++//	participants <!room> <add|remove|promote|demote> <@ghost…>
++//	setting      <!room> <announce|locked> <on|off>      "only admins can send" / "only admins edit info"
++//	user-info    <@ghost|!dm-room>                       about text, phone, business name, blocked
++//	block        <@ghost|!dm-room> <block|unblock>
++package connector
++
++import (
++	"encoding/json"
++	"fmt"
++	"slices"
++	"strings"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/commands"
++	"maunium.net/go/mautrix/bridgev2/simplevent"
++	"maunium.net/go/mautrix/event"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/waid"
++)
++
++func relayReply(ce *commands.Event, nonce string, data map[string]any) {
++	raw, err := json.Marshal(data)
++	if err != nil {
++		raw = []byte(`{"ok":false,"error":"failed to encode reply"}`)
++	}
++	content := &event.MessageEventContent{MsgType: event.MsgNotice, Body: "relay:" + nonce + " " + string(raw)}
++	if _, err = ce.Bot.SendMessage(ce.Ctx, ce.OrigRoomID, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
++		ce.Log.Err(err).Msg("Failed to send Relay command reply")
++	}
++}
++
++func relayFail(ce *commands.Event, nonce string, format string, args ...any) {
++	relayReply(ce, nonce, map[string]any{"ok": false, "error": fmt.Sprintf(format, args...)})
++}
++
++// relayGroupJID resolves a group portal room to its WhatsApp JID.
++func (wa *WhatsAppClient) relayGroupJID(ce *commands.Event, roomID string) (types.JID, *bridgev2.Portal, error) {
++	portal, err := ce.Bridge.GetPortalByMXID(ce.Ctx, id.RoomID(roomID))
++	if err != nil || portal == nil {
++		return types.EmptyJID, nil, fmt.Errorf("portal not found")
++	}
++	jid, err := waid.ParsePortalID(portal.ID)
++	if err != nil {
++		return types.EmptyJID, nil, fmt.Errorf("invalid portal: %w", err)
++	}
++	if jid.Server != types.GroupServer {
++		return types.EmptyJID, nil, fmt.Errorf("not a group chat")
++	}
++	return jid, portal, nil
++}
++
++// relayUserJID resolves a ghost MXID, or a private chat room, to the other person's JID.
++func (wa *WhatsAppClient) relayUserJID(ce *commands.Event, target string) (types.JID, error) {
++	if strings.HasPrefix(target, "!") {
++		portal, err := ce.Bridge.GetPortalByMXID(ce.Ctx, id.RoomID(target))
++		if err != nil || portal == nil {
++			return types.EmptyJID, fmt.Errorf("portal not found")
++		}
++		jid, err := waid.ParsePortalID(portal.ID)
++		if err != nil {
++			return types.EmptyJID, fmt.Errorf("invalid portal: %w", err)
++		}
++		if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
++			return types.EmptyJID, fmt.Errorf("not a private chat")
++		}
++		return jid, nil
++	}
++	userID, ok := ce.Bridge.Matrix.ParseGhostMXID(id.UserID(target))
++	if !ok {
++		return types.EmptyJID, fmt.Errorf("not a WhatsApp user")
++	}
++	jid := waid.ParseUserID(userID)
++	if jid.IsEmpty() {
++		return types.EmptyJID, fmt.Errorf("not a WhatsApp user")
++	}
++	return jid, nil
++}
++
++func (wa *WhatsAppClient) relayGhostMXID(ce *commands.Event, jid types.JID) id.UserID {
++	sender := wa.makeEventSender(ce.Ctx, jid)
++	if sender.IsFromMe {
++		return ce.User.MXID
++	}
++	return ce.Bridge.Matrix.FormatGhostMXID(sender.Sender)
++}
++
++// relayPhone is the phone number (digits only) behind a JID, if WhatsApp has shared it.
++func (wa *WhatsAppClient) relayPhone(ce *commands.Event, jid types.JID) string {
++	if jid.Server == types.DefaultUserServer {
++		return jid.User
++	}
++	if jid.Server == types.HiddenUserServer {
++		if pn, err := wa.GetStore().LIDs.GetPNForLID(ce.Ctx, jid); err == nil && !pn.IsEmpty() {
++			return pn.User
++		}
++	}
++	return ""
++}
++
++func (wa *WhatsAppClient) relayResync(portal *bridgev2.Portal) {
++	wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
++		EventMeta: simplevent.EventMeta{
++			Type:      bridgev2.RemoteEventChatResync,
++			PortalKey: portal.PortalKey,
++		},
++		GetChatInfoFunc: wa.GetChatInfo,
++	})
++}
++
++func (wa *WhatsAppClient) relayPowerCommand(ce *commands.Event) {
++	// ce.Args: ["relay", nonce, op, …]
++	if len(ce.Args) < 3 {
++		ce.Reply("Usage: `sync relay <nonce> <op> [args…]`")
++		return
++	}
++	nonce, op, args := ce.Args[1], strings.ToLower(ce.Args[2]), ce.Args[3:]
++	if !wa.IsLoggedIn() {
++		relayFail(ce, nonce, "not logged in")
++		return
++	}
++	need := func(n int) bool {
++		if len(args) < n {
++			relayFail(ce, nonce, "missing arguments for %s", op)
++			return false
++		}
++		return true
++	}
++	switch op {
++	case "group-info":
++		if !need(1) {
++			return
++		}
++		jid, _, err := wa.relayGroupJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		info, err := wa.Client.GetGroupInfo(ce.Ctx, jid)
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		participants := make([]map[string]any, 0, len(info.Participants))
++		meAdmin := false
++		for _, p := range info.Participants {
++			isMe := wa.IsOwnJID(p.JID)
++			if isMe && (p.IsAdmin || p.IsSuperAdmin) {
++				meAdmin = true
++			}
++			phone := p.PhoneNumber.User
++			if phone == "" {
++				phone = wa.relayPhone(ce, p.JID)
++			}
++			participants = append(participants, map[string]any{
++				"mxid":       wa.relayGhostMXID(ce, p.JID),
++				"phone":      phone,
++				"admin":      p.IsAdmin || p.IsSuperAdmin,
++				"superadmin": p.IsSuperAdmin,
++				"me":         isMe,
++			})
++		}
++		relayReply(ce, nonce, map[string]any{
++			"ok":               true,
++			"name":             info.Name,
++			"topic":            info.Topic,
++			"announce":         info.IsAnnounce,
++			"locked":           info.IsLocked,
++			"approval":         info.IsJoinApprovalRequired,
++			"ephemeral":        info.DisappearingTimer,
++			"created":          info.GroupCreated.Unix(),
++			"owner":            wa.relayPhone(ce, info.OwnerJID),
++			"me_admin":         meAdmin,
++			"participants":     participants,
++			"community":        info.IsParent || info.IsDefaultSubGroup,
++			"member_add_admin": info.MemberAddMode == types.GroupMemberAddModeAdmin,
++		})
++	case "leave":
++		// Leave the WhatsApp group for real (a Matrix leave of yourself isn't reliable for that).
++		if !need(1) {
++			return
++		}
++		jid, _, err := wa.relayGroupJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		if err = wa.Client.LeaveGroup(ce.Ctx, jid); err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		relayReply(ce, nonce, map[string]any{"ok": true})
++	case "invite-link":
++		if !need(1) {
++			return
++		}
++		jid, _, err := wa.relayGroupJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		link, err := wa.Client.GetGroupInviteLink(ce.Ctx, jid, len(args) > 1 && args[1] == "reset")
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		relayReply(ce, nonce, map[string]any{"ok": true, "link": link})
++	case "participants":
++		if !need(3) {
++			return
++		}
++		jid, portal, err := wa.relayGroupJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		action := whatsmeow.ParticipantChange(args[1])
++		if !slices.Contains([]whatsmeow.ParticipantChange{
++			whatsmeow.ParticipantChangeAdd, whatsmeow.ParticipantChangeRemove,
++			whatsmeow.ParticipantChangePromote, whatsmeow.ParticipantChangeDemote,
++		}, action) {
++			relayFail(ce, nonce, "unknown action %s", args[1])
++			return
++		}
++		targets := make([]types.JID, 0, len(args)-2)
++		byJID := make(map[types.JID]string)
++		for _, target := range args[2:] {
++			userJID, err := wa.relayUserJID(ce, target)
++			if err != nil {
++				relayFail(ce, nonce, "%s: %v", target, err)
++				return
++			}
++			targets = append(targets, userJID)
++			byJID[userJID] = target
++		}
++		resp, err := wa.Client.UpdateGroupParticipants(ce.Ctx, jid, targets, action)
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		results := make([]map[string]any, 0, len(resp))
++		for i, r := range resp {
++			target := byJID[r.JID]
++			if target == "" && !r.PhoneNumber.IsEmpty() {
++				target = byJID[r.PhoneNumber]
++			}
++			if target == "" && !r.LID.IsEmpty() {
++				target = byJID[r.LID]
++			}
++			if target == "" && len(resp) == len(targets) {
++				target = args[2+i]
++			}
++			results = append(results, map[string]any{
++				"mxid":   target,
++				"error":  r.Error,
++				"invite": r.AddRequest != nil,
++			})
++		}
++		wa.relayResync(portal)
++		relayReply(ce, nonce, map[string]any{"ok": true, "results": results})
++	case "setting":
++		if !need(3) {
++			return
++		}
++		jid, portal, err := wa.relayGroupJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		on := args[2] == "on"
++		switch args[1] {
++		case "announce":
++			err = wa.Client.SetGroupAnnounce(ce.Ctx, jid, on)
++		case "locked":
++			err = wa.Client.SetGroupLocked(ce.Ctx, jid, on)
++		default:
++			relayFail(ce, nonce, "unknown setting %s", args[1])
++			return
++		}
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		wa.relayResync(portal)
++		relayReply(ce, nonce, map[string]any{"ok": true})
++	case "user-info":
++		if !need(1) {
++			return
++		}
++		jid, err := wa.relayUserJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		out := map[string]any{"ok": true, "phone": wa.relayPhone(ce, jid)}
++		if infos, err := wa.Client.GetUserInfo(ce.Ctx, []types.JID{jid}); err != nil {
++			out["info_error"] = err.Error()
++		} else if info, ok := infos[jid]; ok {
++			out["about"] = info.Status
++			if info.VerifiedName != nil && info.VerifiedName.Details != nil {
++				out["business_name"] = info.VerifiedName.Details.GetVerifiedName()
++			}
++			if out["phone"] == "" && !info.LID.IsEmpty() {
++				out["phone"] = wa.relayPhone(ce, info.LID)
++			}
++		}
++		if blocklist, err := wa.Client.GetBlocklist(ce.Ctx); err == nil {
++			out["blocked"] = relayIsBlocked(ce, wa, blocklist, jid)
++		}
++		relayReply(ce, nonce, out)
++	case "block":
++		if !need(2) {
++			return
++		}
++		jid, err := wa.relayUserJID(ce, args[0])
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		action := events.BlocklistChangeActionBlock
++		if args[1] == "unblock" {
++			action = events.BlocklistChangeActionUnblock
++		}
++		blocklist, err := wa.Client.UpdateBlocklist(ce.Ctx, jid, action)
++		if err != nil {
++			relayFail(ce, nonce, "%v", err)
++			return
++		}
++		relayReply(ce, nonce, map[string]any{"ok": true, "blocked": relayIsBlocked(ce, wa, blocklist, jid)})
++	default:
++		relayFail(ce, nonce, "unknown operation %s", op)
++	}
++}
++
++// relayIsBlocked checks the block list for a person under either of their JIDs (phone or LID).
++func relayIsBlocked(ce *commands.Event, wa *WhatsAppClient, blocklist *types.Blocklist, jid types.JID) bool {
++	if blocklist == nil {
++		return false
++	}
++	alt := types.EmptyJID
++	if jid.Server == types.HiddenUserServer {
++		alt, _ = wa.GetStore().LIDs.GetPNForLID(ce.Ctx, jid)
++	} else if jid.Server == types.DefaultUserServer {
++		alt, _ = wa.GetStore().LIDs.GetLIDForPN(ce.Ctx, jid)
++	}
++	for _, b := range blocklist.JIDs {
++		if b.User == jid.User || (!alt.IsEmpty() && b.User == alt.User) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/connector/relay_presence.go b/pkg/connector/relay_presence.go
+new file mode 100644
+index 0000000..a8ee400
+--- /dev/null
++++ b/pkg/connector/relay_presence.go
+@@ -0,0 +1,127 @@
++// Relay patch: typing indicators.
++//
++// WhatsApp only sends "typing…" to clients that are online, and for one-to-one chats only after
++// subscribing to that contact's presence. Beeper's own app signals "viewing chat" for this, which
++// the open-source bridge never receives. Relay calls POST /v3/relay/viewing instead while a chat is
++// open and the window is focused: the account goes online (like WhatsApp Web does), subscribes to
++// the contact, and goes back offline a couple of minutes after the last call.
++package connector
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"sync"
++	"time"
++
++	"go.mau.fi/whatsmeow/types"
++
++	"go.mau.fi/mautrix-whatsapp/pkg/waid"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/networkid"
++)
++
++const relayOnlineFor = 2 * time.Minute
++
++var (
++	relayPresenceLock  sync.Mutex
++	relayOfflineTimers = map[*WhatsAppClient]*time.Timer{}
++	relaySubscribed    = map[string]time.Time{}            // login|jid -> last SubscribePresence
++	relayRecording     = map[string]map[string]time.Time{} // login|chat -> user ID -> recording until
++)
++
++func (wa *WhatsAppClient) relayNoteRecording(chat, sender types.JID, recording bool, timeout time.Duration) {
++	relayPresenceLock.Lock()
++	defer relayPresenceLock.Unlock()
++	key := string(wa.UserLogin.ID) + "|" + chat.ToNonAD().String()
++	user := string(waid.MakeUserID(sender))
++	if !recording {
++		delete(relayRecording[key], user)
++		return
++	}
++	if relayRecording[key] == nil {
++		relayRecording[key] = map[string]time.Time{}
++	}
++	relayRecording[key][user] = time.Now().Add(timeout)
++}
++
++func (wa *WhatsAppConnector) relayRegisterRoutes() {
++	p, ok := wa.Bridge.Matrix.(bridgev2.MatrixConnectorWithProvisioning)
++	if !ok || p.GetProvisioning() == nil || p.GetProvisioning().GetRouter() == nil {
++		return
++	}
++	p.GetProvisioning().GetRouter().HandleFunc("GET /v3/relay/recording", func(w http.ResponseWriter, r *http.Request) {
++		key := r.URL.Query().Get("login_id") + "|" + r.URL.Query().Get("chat")
++		users := []string{}
++		relayPresenceLock.Lock()
++		for user, until := range relayRecording[key] {
++			if time.Now().Before(until) {
++				users = append(users, user)
++			}
++		}
++		relayPresenceLock.Unlock()
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]any{"recording": users})
++	})
++	p.GetProvisioning().GetRouter().HandleFunc("POST /v3/relay/viewing", func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			LoginID string `json:"login_id"`
++			Chat    string `json:"chat"`
++			Active  bool   `json:"active"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			http.Error(w, `{"error":"bad body"}`, http.StatusBadRequest)
++			return
++		}
++		login := wa.Bridge.GetCachedUserLoginByID(networkid.UserLoginID(body.LoginID))
++		if login == nil {
++			http.Error(w, `{"error":"login not found"}`, http.StatusNotFound)
++			return
++		}
++		client, ok := login.Client.(*WhatsAppClient)
++		if !ok || client.Client == nil || !client.Client.IsLoggedIn() {
++			http.Error(w, `{"error":"not logged in"}`, http.StatusConflict)
++			return
++		}
++		chat, _ := types.ParseJID(body.Chat)
++		client.relayViewing(login.Log.WithContext(wa.Bridge.BackgroundCtx), chat, body.Active)
++		w.WriteHeader(http.StatusNoContent)
++	})
++}
++
++func (wa *WhatsAppClient) relayViewing(ctx context.Context, chat types.JID, active bool) {
++	relayPresenceLock.Lock()
++	defer relayPresenceLock.Unlock()
++	if t := relayOfflineTimers[wa]; t != nil {
++		t.Stop()
++		delete(relayOfflineTimers, wa)
++	}
++	if !active {
++		if wa.lastPresence == types.PresenceAvailable {
++			_ = wa.updatePresence(ctx, types.PresenceUnavailable)
++		}
++		return
++	}
++	if wa.lastPresence != types.PresenceAvailable {
++		if err := wa.updatePresence(ctx, types.PresenceAvailable); err != nil {
++			wa.UserLogin.Log.Warn().Err(err).Msg("Relay: failed to go online")
++		}
++	}
++	relayOfflineTimers[wa] = time.AfterFunc(relayOnlineFor, func() {
++		relayPresenceLock.Lock()
++		defer relayPresenceLock.Unlock()
++		delete(relayOfflineTimers, wa)
++		_ = wa.updatePresence(context.WithoutCancel(ctx), types.PresenceUnavailable)
++	})
++	if chat.Server == types.DefaultUserServer || chat.Server == types.HiddenUserServer {
++		key := string(wa.UserLogin.ID) + "|" + chat.String()
++		if time.Since(relaySubscribed[key]) > 5*time.Minute {
++			relaySubscribed[key] = time.Now()
++			go func() {
++				if err := wa.Client.SubscribePresence(ctx, chat); err != nil {
++					wa.UserLogin.Log.Debug().Err(err).Stringer("chat", chat).Msg("Relay: presence subscription failed")
++				}
++			}()
++		}
++	}
++}
+diff --git a/pkg/connector/relay_stickers.go b/pkg/connector/relay_stickers.go
+new file mode 100644
+index 0000000..d3b981f
+--- /dev/null
++++ b/pkg/connector/relay_stickers.go
+@@ -0,0 +1,303 @@
++// Relay patch: favorite stickers.
++//
++// WhatsApp syncs your favorite stickers to linked devices through app state ("favoriteSticker"
++// mutations), which the bridge normally ignores. This keeps them in favorite-stickers.json in the
++// bridge's working directory, with each sticker uploaded to Matrix, so Relay can offer them in its
++// sticker picker. `!wa sync favorite-stickers --login=<id>` fetches the full list; later changes
++// arrive on their own.
++package connector
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"os"
++	"strings"
++	"sync"
++	"time"
++
++	"go.mau.fi/whatsmeow"
++	"go.mau.fi/whatsmeow/appstate"
++	"go.mau.fi/whatsmeow/proto/waE2E"
++	"go.mau.fi/whatsmeow/proto/waSyncAction"
++	"go.mau.fi/whatsmeow/types/events"
++	"google.golang.org/protobuf/proto"
++)
++
++const relayStickerFile = "favorite-stickers.json"
++
++type relayFavoriteSticker struct {
++	MXC       string `json:"mxc,omitempty"`
++	Mimetype  string `json:"mimetype,omitempty"`
++	Width     uint32 `json:"w,omitempty"`
++	Height    uint32 `json:"h,omitempty"`
++	Size      int    `json:"size,omitempty"`
++	Favorite  bool   `json:"favorite"`
++	Lottie    bool   `json:"lottie,omitempty"`
++	Timestamp int64  `json:"ts"`
++	Error     string `json:"error,omitempty"`
++	Requested int64  `json:"requested,omitempty"`
++	Path      string `json:"path,omitempty"`
++	URL       string `json:"url,omitempty"`
++}
++
++var (
++	relayStickerLock    sync.Mutex
++	relayStickerSyncing sync.Map // *WhatsAppClient -> struct{}
++)
++
++func relayLoadStickers() map[string]map[string]*relayFavoriteSticker {
++	out := map[string]map[string]*relayFavoriteSticker{}
++	if data, err := os.ReadFile(relayStickerFile); err == nil {
++		_ = json.Unmarshal(data, &out)
++	}
++	return out
++}
++
++func relaySaveStickers(all map[string]map[string]*relayFavoriteSticker) error {
++	data, err := json.MarshalIndent(all, "", "  ")
++	if err != nil {
++		return err
++	}
++	tmp := relayStickerFile + ".tmp"
++	if err = os.WriteFile(tmp, data, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, relayStickerFile)
++}
++
++// relayIgnoreDuringStickerSync drops the chat-state events (archive, pin, mute, …) that a forced
++// full app state resync replays, so fetching stickers doesn't touch anything else.
++func (wa *WhatsAppClient) relayIgnoreDuringStickerSync(rawEvt any) bool {
++	if _, syncing := relayStickerSyncing.Load(wa); !syncing {
++		return false
++	}
++	switch rawEvt.(type) {
++	case *events.Archive, *events.Pin, *events.Mute, *events.Star, *events.DeleteForMe, *events.DeleteChat,
++		*events.ClearChat, *events.MarkChatAsRead, *events.Contact, *events.PushNameSetting,
++		*events.UnarchiveChatsSetting, *events.UserStatusMute, *events.LabelEdit, *events.LabelAssociationChat,
++		*events.LabelAssociationMessage, *events.AppStateSyncComplete:
++		return true
++	}
++	return false
++}
++
++func (wa *WhatsAppClient) relayHandleAppState(ctx context.Context, evt *events.AppState) {
++	if len(evt.Index) < 2 || evt.Index[0] != appstate.IndexFavoriteSticker {
++		return
++	}
++	action := evt.SyncActionValue.GetStickerAction()
++	if action == nil {
++		return
++	}
++	key := evt.Index[1]
++	ts := evt.SyncActionValue.GetTimestamp()
++	_, force := relayStickerSyncing.Load(wa) // an explicit full sync retries expired ones right away
++	go wa.relayStoreSticker(ctx, key, ts, action, force)
++}
++
++func (wa *WhatsAppClient) relayStoreSticker(ctx context.Context, key string, ts int64, action *waSyncAction.StickerAction, force bool) {
++	log := wa.UserLogin.Log.With().Str("relay_sticker", key).Logger()
++	login := string(wa.UserLogin.ID)
++
++	relayStickerLock.Lock()
++	existing := relayLoadStickers()[login][key]
++	relayStickerLock.Unlock()
++	if existing != nil && existing.Timestamp > ts {
++		return
++	}
++	entry := &relayFavoriteSticker{
++		Mimetype:  action.GetMimetype(),
++		Width:     action.GetWidth(),
++		Height:    action.GetHeight(),
++		Favorite:  action.GetIsFavorite(),
++		Lottie:    action.GetIsLottie(),
++		Timestamp: ts,
++		Path:      action.GetDirectPath(),
++		URL:       action.GetURL(),
++	}
++	if existing != nil && existing.MXC != "" {
++		entry.MXC, entry.Size = existing.MXC, existing.Size
++	}
++	if entry.Favorite && entry.MXC == "" && !entry.Lottie {
++		data, err := wa.relayDownloadSticker(ctx, key, action)
++		if err != nil {
++			log.Debug().Err(err).Msg("Favorite sticker link expired, asking the phone to upload it again")
++			entry.Error = err.Error()
++			if force || existing == nil || time.Since(time.UnixMilli(existing.Requested)) > 6*time.Hour {
++				entry.Requested = time.Now().UnixMilli()
++				wa.relayRequestReupload(key)
++			} else {
++				entry.Requested = existing.Requested
++			}
++		} else if mxc, _, err := wa.Main.Bridge.Bot.UploadMedia(ctx, "", data, "sticker.webp", entry.Mimetype); err != nil {
++			log.Warn().Err(err).Msg("Failed to upload favorite sticker")
++			entry.Error = err.Error()
++		} else {
++			entry.MXC = string(mxc)
++			entry.Size = len(data)
++		}
++	}
++
++	relayStickerLock.Lock()
++	defer relayStickerLock.Unlock()
++	all := relayLoadStickers()
++	if all[login] == nil {
++		all[login] = map[string]*relayFavoriteSticker{}
++	}
++	all[login][key] = entry
++	if err := relaySaveStickers(all); err != nil {
++		log.Err(err).Msg("Failed to save favorite stickers")
++	}
++}
++
++func (wa *WhatsAppClient) relayDownloadSticker(ctx context.Context, key string, action *waSyncAction.StickerAction) ([]byte, error) {
++	if action.GetDirectPath() == "" {
++		return nil, errors.New("no download path")
++	}
++	// The app state index is the sticker's plaintext SHA-256.
++	fileHash, _ := base64.StdEncoding.DecodeString(key)
++	if len(fileHash) != 32 {
++		fileHash = nil
++	}
++	var data []byte
++	var err error
++	for _, mms := range []string{"image", "sticker"} {
++		data, err = wa.Client.DownloadMediaWithPath(ctx, action.GetDirectPath(), action.GetFileEncSHA256(), fileHash,
++			action.GetMediaKey(), whatsmeow.MediaImage, mms, fileHash == nil)
++		if errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) && fileHash == nil && len(data) > 0 {
++			err = nil
++		}
++		if err == nil {
++			return data, nil
++		}
++	}
++	return nil, err
++}
++
++// relaySyncFavoriteStickers re-reads the app state collections from scratch so every existing
++// favorite sticker is replayed as an AppState event.
++func (wa *WhatsAppClient) relaySyncFavoriteStickers(ctx context.Context) error {
++	relayStickerSyncing.Store(wa, struct{}{})
++	prevEmit := wa.Client.EmitAppStateEventsOnFullSync
++	wa.Client.EmitAppStateEventsOnFullSync = true
++	defer func() {
++		wa.Client.EmitAppStateEventsOnFullSync = prevEmit
++		relayStickerSyncing.Delete(wa)
++	}()
++	var errs []error
++	for _, name := range []appstate.WAPatchName{appstate.WAPatchRegularLow, appstate.WAPatchRegular, appstate.WAPatchRegularHigh} {
++		if err := wa.Client.FetchAppState(ctx, name, true, false); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	relayStickerLock.Lock()
++	all := relayLoadStickers()
++	if all["_synced"] == nil {
++		all["_synced"] = map[string]*relayFavoriteSticker{}
++	}
++	all["_synced"][string(wa.UserLogin.ID)] = &relayFavoriteSticker{Timestamp: time.Now().UnixMilli()}
++	_ = relaySaveStickers(all)
++	relayStickerLock.Unlock()
++	return errors.Join(errs...)
++}
++
++// ---- Expired favorites: ask the phone to upload them again ----
++
++var relayReuploadQueues sync.Map // *WhatsAppClient -> chan string
++
++// relayRequestReupload queues an UPLOAD_STICKER peer request (one at a time, spaced out) for a
++// favorite whose download link expired. The phone answers with a fresh StickerMessage.
++func (wa *WhatsAppClient) relayRequestReupload(key string) {
++	q, loaded := relayReuploadQueues.LoadOrStore(wa, make(chan string, 1024))
++	ch := q.(chan string)
++	if !loaded {
++		go func() {
++			ctx := wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
++			for k := range ch {
++				_, err := wa.Client.SendPeerMessage(ctx, &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
++					Type: waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE.Enum(),
++					PeerDataOperationRequestMessage: &waE2E.PeerDataOperationRequestMessage{
++						PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_UPLOAD_STICKER.Enum(),
++						RequestStickerReupload: []*waE2E.PeerDataOperationRequestMessage_RequestStickerReupload{
++							{FileSHA256: proto.String(k)},
++						},
++					},
++				}})
++				if err != nil {
++					wa.UserLogin.Log.Warn().Err(err).Str("relay_sticker", k).Msg("Failed to request sticker reupload")
++				}
++				time.Sleep(1500 * time.Millisecond)
++			}
++		}()
++	}
++	select {
++	case ch <- key:
++	default:
++	}
++}
++
++// relayHandlePeerResponse picks up the phone's answers to UPLOAD_STICKER requests.
++func (wa *WhatsAppClient) relayHandlePeerResponse(rawEvt any) bool {
++	evt, ok := rawEvt.(*events.Message)
++	if !ok {
++		return false
++	}
++	resp := evt.Message.GetProtocolMessage().GetPeerDataOperationRequestResponseMessage()
++	if resp == nil || resp.GetPeerDataOperationRequestType() != waE2E.PeerDataOperationRequestType_UPLOAD_STICKER {
++		return false
++	}
++	ctx := wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
++	results := resp.GetPeerDataOperationResult()
++	withSticker := 0
++	for _, r := range results {
++		if r.GetStickerMessage() != nil {
++			withSticker++
++		}
++	}
++	upload := ""
++	if len(results) > 0 {
++		upload = results[0].GetMediaUploadResult().String()
++	}
++	wa.UserLogin.Log.Info().Int("results", len(results)).Int("stickers", withSticker).Str("upload_result", upload).
++		Msg("Relay: phone answered a sticker reupload request")
++	for _, result := range results {
++		if sticker := result.GetStickerMessage(); sticker != nil && len(sticker.GetFileSHA256()) == 32 {
++			go wa.relayStoreReuploaded(ctx, sticker)
++		}
++	}
++	return true
++}
++
++func (wa *WhatsAppClient) relayStoreReuploaded(ctx context.Context, sticker *waE2E.StickerMessage) {
++	key := base64.StdEncoding.EncodeToString(sticker.GetFileSHA256())
++	log := wa.UserLogin.Log.With().Str("relay_sticker", key).Logger()
++	login := string(wa.UserLogin.ID)
++	mime := sticker.GetMimetype()
++	if mime == "" || strings.Contains(mime, "was") {
++		return // Lottie stickers can't be shown outside WhatsApp
++	}
++	data, err := wa.Client.Download(ctx, sticker)
++	if err != nil {
++		log.Warn().Err(err).Msg("Failed to download reuploaded sticker")
++		return
++	}
++	mxc, _, err := wa.Main.Bridge.Bot.UploadMedia(ctx, "", data, "sticker.webp", mime)
++	if err != nil {
++		log.Warn().Err(err).Msg("Failed to upload reuploaded sticker")
++		return
++	}
++	relayStickerLock.Lock()
++	defer relayStickerLock.Unlock()
++	all := relayLoadStickers()
++	entry := all[login][key]
++	if entry == nil {
++		return // not one of this account's favorites
++	}
++	entry.MXC, entry.Size, entry.Error = string(mxc), len(data), ""
++	entry.Mimetype, entry.Width, entry.Height = mime, sticker.GetWidth(), sticker.GetHeight()
++	if err = relaySaveStickers(all); err != nil {
++		log.Err(err).Msg("Failed to save favorite stickers")
++	}
++}
+diff --git a/pkg/connector/userinfo.go b/pkg/connector/userinfo.go
+index c78b0a8..268cf94 100644
+--- a/pkg/connector/userinfo.go
++++ b/pkg/connector/userinfo.go
+@@ -374,6 +374,12 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
+ 			Remove: true,
+ 		}
+ 	} else if errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) {
++		// Relay patch: "unauthorized" means *this* account can't see the photo (e.g. it lacks the
++		// contact's privacy token), not that there is none. With several accounts, another one may
++		// have fetched it already, so keep that instead of wiping it.
++		if ghost.AvatarMXC != "" {
++			return false
++		}
+ 		wrappedAvatar = &bridgev2.Avatar{
+ 			ID:     "unauthorized",
+ 			Remove: true,
+diff --git a/pkg/msgconv/from-matrix.go b/pkg/msgconv/from-matrix.go
+index 57f9113..13c61d5 100644
+--- a/pkg/msgconv/from-matrix.go
++++ b/pkg/msgconv/from-matrix.go
+@@ -122,6 +122,10 @@ func (mc *MessageConverter) ToWhatsApp(
+ 			return nil, nil, err
+ 		}
+ 		message = mc.constructMediaMessage(ctx, content, evt, uploaded, thumbnail, contextInfo, mime)
++		// Relay patch: send as view once when the Matrix event asks for it.
++		if viewOnce, _ := evt.Content.Raw["dev.relay.view_once"].(bool); viewOnce && message != nil {
++			message = relayViewOnce(message)
++		}
+ 	case event.MsgLocation:
+ 		lat, long, err := parseGeoURI(content.GeoURI)
+ 		if err != nil {
+@@ -441,7 +445,7 @@ func (mc *MessageConverter) convertToJPEG(webpImage []byte) ([]byte, error) {
+ 	}
+ 
+ 	var jpgBuffer bytes.Buffer
+-	if err = jpeg.Encode(&jpgBuffer, decoded, &jpeg.Options{Quality: 80}); err != nil {
++	if err = jpeg.Encode(&jpgBuffer, decoded, &jpeg.Options{Quality: 92}); err != nil { // Relay patch: was 80
+ 		return nil, fmt.Errorf("failed to encode png image: %w", err)
+ 	}
+ 
+@@ -688,3 +692,19 @@ func getAudioInfo(content *event.MessageEventContent) (output []byte, duration u
+ 	}
+ 	return
+ }
++
++// relayViewOnce wraps a photo, video or voice message the way WhatsApp sends view-once media.
++func relayViewOnce(msg *waE2E.Message) *waE2E.Message {
++	switch {
++	case msg.ImageMessage != nil:
++		msg.ImageMessage.ViewOnce = proto.Bool(true)
++	case msg.VideoMessage != nil:
++		msg.VideoMessage.ViewOnce = proto.Bool(true)
++	case msg.AudioMessage != nil:
++		msg.AudioMessage.ViewOnce = proto.Bool(true)
++		return &waE2E.Message{ViewOnceMessageV2Extension: &waE2E.FutureProofMessage{Message: msg}}
++	default:
++		return msg
++	}
++	return &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{Message: msg}}
++}
