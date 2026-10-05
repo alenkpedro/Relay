@@ -96,6 +96,16 @@ Turn on AI and Relay can summarize, translate and plan your day. Run a model on 
 
 ## Install
 
+**The quick way:** paste this into Terminal.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alenkpedro/relay/main/install.sh | sh
+```
+
+It picks the right build for your Mac, checks it against the checksum published with the release, installs it into Applications and opens it, with no Gatekeeper prompt. The [script](install.sh) is short if you'd like to read it first.
+
+**Or download it yourself:**
+
 1. Download the `.dmg` for your Mac from the [latest release](https://github.com/alenkpedro/relay/releases/latest): `arm64` for Apple silicon (M1 or newer), `x64` for Intel.
 2. Open it and drag Relay to **Applications**.
 3. If macOS won't open it the first time, go to **System Settings → Privacy & Security → Open Anyway**.
